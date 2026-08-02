@@ -183,6 +183,70 @@ jobs:
             echo "generate_icons.py tidak ditemukan, skip step ini."
           fi
 
+      # Jaring pengaman icon: resource mipmap/drawable yang direferensikan
+      # AndroidManifest.xml / res/*.xml tapi filenya nggak ada → dibuat PNG placeholder.
+      # (Sama seperti ensureIconResources di worker/pipeline/android.js sisi VPS.)
+      - name: Ensure Placeholder Icons (mipmap/drawable)
+        if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'sync'
+        env:
+          PR: ${{ steps.detect.outputs.project_root }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, re, sys, itertools
+          from PIL import Image
+
+          root = os.environ.get('PR', '.')
+          res_root = os.path.join(root, 'app', 'src', 'main', 'res')
+          manifest = os.path.join(root, 'app', 'src', 'main', 'AndroidManifest.xml')
+          densities = ['mdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi']
+
+          pat = re.compile(r'@(mipmap|drawable)/([\w]+)')
+          refs = set()
+
+          for base, dirs, files in os.walk(res_root):
+              for f in files:
+                  if not f.endswith('.xml'):
+                      continue
+                  try:
+                      txt = open(os.path.join(base, f), encoding='utf-8', errors='ignore').read()
+                  except Exception:
+                      continue
+                  for m in pat.finditer(txt):
+                      refs.add((m.group(1), m.group(2)))
+
+          try:
+              txt = open(manifest, encoding='utf-8', errors='ignore').read()
+              for m in pat.finditer(txt):
+                  refs.add((m.group(1), m.group(2)))
+          except Exception:
+              pass
+
+          if not refs:
+              print('[ICONS] tidak ada referensi icon, skip')
+              sys.exit(0)
+
+          sizes = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
+          for (kind, name) in sorted(refs):
+              created = 0
+              folders = [os.path.join(res_root, f'{kind}-{d}') for d in densities]
+              folders = [d for d in folders if os.path.isdir(d)]
+              if not folders:
+                  os.makedirs(folders_dummy := os.path.join(res_root, f'{kind}-mdpi'), exist_ok=True)
+                  folders = [folders_dummy]
+              for d in folders:
+                  target = os.path.join(d, f'{name}.png')
+                  if os.path.exists(target):
+                      continue
+                  dens = os.path.basename(d).replace(f'{kind}-', '')
+                  size = sizes.get(dens, 96)
+                  Image.new('RGBA', (size, size), (30, 136, 229, 255)).save(target)
+                  created += 1
+              if created:
+                  print(f'[ICONS] dibuat placeholder: {kind}/{name} ({created} density)')
+
+          print('[ICONS] selesai')
+          PYEOF
+
       - name: Setup Gradle Wrapper (versi dinamis sesuai project)
         if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'sync'
         env:
