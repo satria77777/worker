@@ -1,0 +1,340 @@
+name: Build Sync XxX APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Job ID dari bot'
+        required: false
+        default: ''
+        type: string
+      userId:
+        description: 'User ID'
+        required: false
+        default: ''
+        type: string
+      payload:
+        description: 'Payload JSON dari bot (berisi url source ZIP)'
+        required: false
+        default: ''
+        type: string
+      appName:
+        description: 'Nama aplikasi'
+        required: false
+        default: 'AndroidApp'
+        type: string
+      buildType:
+        description: 'Tipe build (release/debug)'
+        required: false
+        default: 'release'
+        type: string
+      flavor:
+        description: 'Flavor build (kalau project pakai product flavors)'
+        required: false
+        default: 'default'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── SOURCE ─────────────────────────────────────────────────────────
+      # Dipicu bot (workflow_dispatch + payload.url) → download source ZIP.
+      # Dipicu push manual → pakai isi repo.
+      - name: Download source ZIP dari bot (jika ada)
+        id: source
+        run: |
+          PAYLOAD="${{ github.event.inputs.payload }}"
+          URL=""
+          APP_NAME="${{ github.event.inputs.appName }}"
+          BUILD_TYPE="${{ github.event.inputs.buildType }}"
+          if [ -n "$PAYLOAD" ] && [ "$PAYLOAD" != "null" ]; then
+            URL=$(echo "$PAYLOAD" | jq -r '.url // empty')
+            if [ -z "$APP_NAME" ] || [ "$APP_NAME" = "null" ]; then
+              APP_NAME=$(echo "$PAYLOAD" | jq -r '.appName // empty')
+            fi
+            if [ -z "$BUILD_TYPE" ] || [ "$BUILD_TYPE" = "null" ]; then
+              BUILD_TYPE=$(echo "$PAYLOAD" | jq -r '.buildType // empty')
+            fi
+          fi
+
+          if [ -n "$URL" ]; then
+            echo "Downloading source dari bot: $URL"
+            curl -fsSL -o project.zip "$URL"
+            mkdir -p project
+            unzip -q project.zip -d project
+            echo "PROJECT_ROOT=project" >> "$GITHUB_ENV"
+          else
+            echo "Tidak ada payload, pakai isi repo."
+            echo "PROJECT_ROOT=." >> "$GITHUB_ENV"
+          fi
+          if [ -n "$APP_NAME" ] && [ "$APP_NAME" != "null" ]; then
+            echo "APP_NAME=$APP_NAME" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$BUILD_TYPE" ] && [ "$BUILD_TYPE" != "null" ]; then
+            echo "BUILD_TYPE=$BUILD_TYPE" >> "$GITHUB_ENV"
+          fi
+
+      # ── DETEKSI ────────────────────────────────────────────────────────
+      - name: Detect Project Type (Flutter / Android / Sync)
+        id: detect
+        run: |
+          ROOT="$PROJECT_ROOT"
+          TYPE="unknown"
+          PR=""
+
+          # FLUTTER
+          F_ROOT=$(find "$ROOT" -maxdepth 4 -name "pubspec.yaml" -type f | head -1 | xargs -r dirname)
+          if [ -n "$F_ROOT" ]; then
+            TYPE="flutter"
+            PR="$F_ROOT"
+          fi
+
+          # ANDROID / SYNC (gradle native)
+          if [ "$TYPE" = "unknown" ]; then
+            G_ROOT=$(find "$ROOT" -maxdepth 4 \( -name "gradlew" -o -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "build.gradle" \) -not -path "*/app/*" 2>/dev/null | head -1 | xargs -r dirname)
+            if [ -z "$G_ROOT" ]; then
+              G_ROOT=$(find "$ROOT" -maxdepth 4 -name "build.gradle" 2>/dev/null | head -1 | xargs -r dirname)
+            fi
+            if [ -z "$G_ROOT" ] && [ -f "$ROOT/android/gradlew" ]; then
+              G_ROOT="$ROOT/android"
+            fi
+            if [ -n "$G_ROOT" ]; then
+              if [ -f "$G_ROOT/syncxxx.marker" ] || [ -f "$G_ROOT/SyncXxX.marker" ] || [ -d "$G_ROOT/syncxxx" ]; then
+                TYPE="sync"
+              else
+                TYPE="android"
+              fi
+              PR="$G_ROOT"
+            fi
+          fi
+
+          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
+          echo "project_root=$PR" >> "$GITHUB_OUTPUT"
+          echo "✅ Project terdeteksi: $TYPE (root=$PR)"
+
+      - name: Unknown Project Type
+        if: steps.detect.outputs.type == 'unknown'
+        run: |
+          echo "::error::Tidak ada base yang dikenali. Pastikan source berisi project Flutter (pubspec.yaml) atau Android native (gradlew/build.gradle)."
+          exit 1
+
+      # ── TOOLCHAIN ──────────────────────────────────────────────────────
+      - name: Set up JDK 17
+        if: steps.detect.outputs.type != 'unknown'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Python
+        if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'sync'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Pillow
+        if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'sync'
+        run: pip install Pillow
+
+      - name: Set up Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+
+      - name: Install Android SDK components (best-effort)
+        if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'sync'
+        run: |
+          SDKMANAGER=""
+          if command -v sdkmanager >/dev/null 2>&1; then
+            SDKMANAGER=sdkmanager
+          elif [ -n "$ANDROID_HOME" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          elif [ -n "$ANDROID_HOME" ] && [ -x "$ANDROID_HOME/tools/bin/sdkmanager" ]; then
+            SDKMANAGER="$ANDROID_HOME/tools/bin/sdkmanager"
+          fi
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
+          fi
+
+      # ── ICON + GRADLE WRAPPER ──────────────────────────────────────────
+      - name: Generate App Icons (kalau ada script-nya)
+        if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'sync'
+        run: |
+          ROOT="$PROJECT_ROOT"
+          PR="${{ steps.detect.outputs.project_root }}"
+          if [ -f "$ROOT/generate_icons.py" ]; then
+            cd "$ROOT" && python3 generate_icons.py
+          elif [ -f "$PR/generate_icons.py" ]; then
+            cd "$PR" && python3 generate_icons.py
+          else
+            echo "generate_icons.py tidak ditemukan, skip step ini."
+          fi
+
+      # Jaring pengaman icon: resource mipmap/drawable yang direferensikan
+      # AndroidManifest.xml / res/*.xml tapi filenya nggak ada → dibuat PNG placeholder.
+      # (Sama seperti ensureIconResources di worker/pipeline/android.js sisi VPS.)
+      - name: Ensure Placeholder Icons (mipmap/drawable)
+        if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'sync'
+        env:
+          PR: ${{ steps.detect.outputs.project_root }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, re, sys, itertools
+          from PIL import Image
+
+          root = os.environ.get('PR', '.')
+          res_root = os.path.join(root, 'app', 'src', 'main', 'res')
+          manifest = os.path.join(root, 'app', 'src', 'main', 'AndroidManifest.xml')
+          densities = ['mdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi']
+
+          pat = re.compile(r'@(mipmap|drawable)/([\w]+)')
+          refs = set()
+
+          for base, dirs, files in os.walk(res_root):
+              for f in files:
+                  if not f.endswith('.xml'):
+                      continue
+                  try:
+                      txt = open(os.path.join(base, f), encoding='utf-8', errors='ignore').read()
+                  except Exception:
+                      continue
+                  for m in pat.finditer(txt):
+                      refs.add((m.group(1), m.group(2)))
+
+          try:
+              txt = open(manifest, encoding='utf-8', errors='ignore').read()
+              for m in pat.finditer(txt):
+                  refs.add((m.group(1), m.group(2)))
+          except Exception:
+              pass
+
+          if not refs:
+              print('[ICONS] tidak ada referensi icon, skip')
+              sys.exit(0)
+
+          sizes = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
+          for (kind, name) in sorted(refs):
+              created = 0
+              folders = [os.path.join(res_root, f'{kind}-{d}') for d in densities]
+              folders = [d for d in folders if os.path.isdir(d)]
+              if not folders:
+                  os.makedirs(folders_dummy := os.path.join(res_root, f'{kind}-mdpi'), exist_ok=True)
+                  folders = [folders_dummy]
+              for d in folders:
+                  target = os.path.join(d, f'{name}.png')
+                  if os.path.exists(target):
+                      continue
+                  dens = os.path.basename(d).replace(f'{kind}-', '')
+                  size = sizes.get(dens, 96)
+                  Image.new('RGBA', (size, size), (30, 136, 229, 255)).save(target)
+                  created += 1
+              if created:
+                  print(f'[ICONS] dibuat placeholder: {kind}/{name} ({created} density)')
+
+          print('[ICONS] selesai')
+          PYEOF
+
+      - name: Setup Gradle Wrapper (versi dinamis sesuai project)
+        if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'sync'
+        env:
+          PR: ${{ steps.detect.outputs.project_root }}
+        run: |
+          WRAPPER_PROPS="$PR/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$WRAPPER_PROPS" ]; then
+            GRADLE_VERSION=$(grep -oP '(?<=gradle-)[0-9.]+(?=-bin.zip|-all.zip)' "$WRAPPER_PROPS" | head -1)
+          fi
+          if [ -z "$GRADLE_VERSION" ]; then
+            GRADLE_VERSION="8.4.0"
+            echo "Versi Gradle tidak terdeteksi dari project, pakai default $GRADLE_VERSION"
+          else
+            echo "Versi Gradle terdeteksi dari project: $GRADLE_VERSION"
+          fi
+
+          if [ ! -f "$PR/gradle/wrapper/gradle-wrapper.jar" ]; then
+            mkdir -p "$PR/gradle/wrapper"
+            curl -fsSL -o "$PR/gradle/wrapper/gradle-wrapper.jar" \
+              "https://github.com/gradle/gradle/raw/v${GRADLE_VERSION}/gradle/wrapper/gradle-wrapper.jar"
+          fi
+          chmod +x "$PR/gradlew" 2>/dev/null || true
+
+      - name: Cache Gradle
+        if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'sync'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # ── BUILD ──────────────────────────────────────────────────────────
+      - name: Build APK
+        env:
+          PR: ${{ steps.detect.outputs.project_root }}
+          TYPE: ${{ steps.detect.outputs.type }}
+          FLAVOR: ${{ github.event.inputs.flavor || 'default' }}
+        run: |
+          cd "$PR"
+          BUILD_TYPE="${BUILD_TYPE:-release}"
+          if [ "$TYPE" = "flutter" ]; then
+            flutter pub get
+            if [ "$BUILD_TYPE" = "debug" ]; then
+              flutter build apk --debug
+            else
+              flutter build apk --release
+            fi
+          else
+            TASK_TYPE="$(echo "${BUILD_TYPE:0:1}" | tr '[:lower:]' '[:upper:]')${BUILD_TYPE:1}"
+            if [ "$FLAVOR" != "default" ] && [ -n "$FLAVOR" ]; then
+              FLAVOR_CAP="$(echo "${FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR:1}"
+              TASK="assemble${FLAVOR_CAP}${TASK_TYPE}"
+            else
+              TASK="assemble${TASK_TYPE}"
+            fi
+            echo "Menjalankan task: $TASK"
+            ./gradlew "$TASK" --no-daemon --stacktrace
+          fi
+
+      # ── RENAME + UPLOAD ────────────────────────────────────────────────
+      - name: Rename APK
+        env:
+          PR: ${{ steps.detect.outputs.project_root }}
+          TYPE: ${{ steps.detect.outputs.type }}
+        run: |
+          mkdir -p output
+          APK_FILE=$(find "$PR/app/build/outputs/apk/" -name "*.apk" 2>/dev/null | head -1)
+          [ -z "$APK_FILE" ] && APK_FILE=$(find "$PR/build/app/outputs/flutter-apk/" -name "*.apk" 2>/dev/null | head -1)
+          [ -z "$APK_FILE" ] && APK_FILE=$(find "$PR" -name "*.apk" -path "*outputs*" 2>/dev/null | head -1)
+          if [ -z "$APK_FILE" ]; then
+            echo "❌ Tidak ada file APK yang ketemu."
+            find . -name "*.apk" -type f 2>/dev/null || true
+            exit 1
+          fi
+          SAFE_NAME=$(echo "${APP_NAME:-AndroidApp}" | tr -cd '[:alnum:]_-')
+          [ -z "$SAFE_NAME" ] && SAFE_NAME="SyncXxX"
+          cp "$APK_FILE" "output/${SAFE_NAME}.apk"
+          echo "apk_name=${SAFE_NAME}.apk" >> "$GITHUB_ENV"
+          echo "📦 APK siap: output/${SAFE_NAME}.apk"
+          ls -la output/
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CyberPro-APK
+          path: output/${{ env.apk_name }}
+          retention-days: 30
+          if-no-files-found: error
