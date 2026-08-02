@@ -248,6 +248,20 @@ jobs:
           print('[ICONS] selesai')
           PYEOF
 
+      # Patch bug umum yang bikin compile gagal di base Android:
+      #  - android.content.DisplayManager tidak ada → ganti ke android.hardware.display.DisplayManager
+      #  - Intent.ACTION_UNINSTALL_DATA tidak ada → ganti ke Intent.ACTION_UNINSTALL_PACKAGE
+      - name: Patch Known Compile Issues (Android)
+        if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'sync'
+        env:
+          PR: ${{ steps.detect.outputs.project_root }}
+        run: |
+          find "$PR" \( -name "*.kt" -o -name "*.java" \) -type f | while read -r f; do
+            sed -i 's/android\.content\.DisplayManager/android.hardware.display.DisplayManager/g' "$f"
+            sed -i 's/Intent\.ACTION_UNINSTALL_DATA/Intent.ACTION_UNINSTALL_PACKAGE/g' "$f"
+          done
+          echo "Patch compile issues selesai."
+
       - name: Setup Gradle Wrapper (versi dinamis sesuai project)
         if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'sync'
         env:
