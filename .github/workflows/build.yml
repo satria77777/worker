@@ -151,7 +151,8 @@ jobs:
         if: steps.detect.outputs.type == 'flutter'
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.22.0'
+          # Pakai stable terbaru biar paket modern (mis. package_info_plus 10.x)
+          # yang butuh Dart SDK terbaru tidak gagal "requires SDK version".
           channel: 'stable'
 
       - name: Install Android SDK components (best-effort)
@@ -306,7 +307,17 @@ jobs:
           cd "$PR"
           BUILD_TYPE="${BUILD_TYPE:-release}"
           if [ "$TYPE" = "flutter" ]; then
-            flutter pub get
+            if ! flutter pub get; then
+              echo "🔧 pub get gagal (kemungkinan SDK terlalu lama). Auto-update Flutter ke stable terbaru..."
+              RELEASES=$(curl -fsSL "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json")
+              VERSION=$(echo "$RELEASES" | grep -oP '"version":\s*"\K[0-9.]+' | head -1)
+              curl -fsSL -o /tmp/flutter-update.tar.xz "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${VERSION}-stable.tar.xz"
+              rm -rf /opt/flutter-latest && mkdir -p /opt/flutter-latest
+              tar -xf /tmp/flutter-update.tar.xz -C /opt/flutter-latest
+              export PATH="/opt/flutter-latest/flutter/bin:$PATH"
+              flutter --version
+              flutter pub get
+            fi
             if [ "$BUILD_TYPE" = "debug" ]; then
               flutter build apk --debug
             else
