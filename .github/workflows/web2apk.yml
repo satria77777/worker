@@ -1,0 +1,356 @@
+name: Vorlex Web2APK Build
+run-name: Web2APK - ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+        type: string
+      app_name:
+        required: true
+        type: string
+      package_name:
+        required: true
+        type: string
+      source_type:
+        required: true
+        type: string
+      source_url:
+        required: false
+        type: string
+      source_filename:
+        required: false
+        type: string
+      build_mode:
+        required: true
+        type: string
+      build_variant:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout build input
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Gradle
+        if: inputs.build_mode == 'native'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Flutter
+        if: inputs.build_mode == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare source
+        env:
+          SOURCE_TYPE: ${{ inputs.source_type }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          SOURCE_FILENAME: ${{ inputs.source_filename }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/vorlex-site
+          mkdir -p /tmp/vorlex-site
+          case "$SOURCE_TYPE" in
+            url|remote)
+              case "$SOURCE_URL" in
+                http://*|https://*) ;;
+                *) echo "Invalid source URL"; exit 1;;
+              esac
+              curl -L --fail --max-time 300 --retry 3 -o /tmp/source.bin "$SOURCE_URL"
+              if [[ "$SOURCE_URL" == *.zip ]]; then
+                unzip -q /tmp/source.bin -d /tmp/vorlex-site
+              else
+                cp /tmp/source.bin /tmp/vorlex-site/index.html
+              fi
+              ;;
+            file)
+              if [ -f "input/${JOB_ID}/index.html" ]; then
+                cp "input/${JOB_ID}/index.html" /tmp/vorlex-site/index.html
+              elif [ -f "input/${JOB_ID}/site.zip" ]; then
+                unzip -q "input/${JOB_ID}/site.zip" -d /tmp/vorlex-site
+              fi
+              ;;
+            *) echo "Unsupported source type: $SOURCE_TYPE"; exit 1;;
+          esac
+          if [ ! -f /tmp/vorlex-site/index.html ]; then
+            FIRST_HTML=$(find /tmp/vorlex-site -type f -iname '*.html' | head -1 || true)
+            if [ -n "$FIRST_HTML" ]; then
+              cp "$FIRST_HTML" /tmp/vorlex-site/index.html
+            else
+              echo '<!doctype html><meta charset="utf-8"><title>Vorlex</title><p>Empty site' > /tmp/vorlex-site/index.html
+            fi
+          fi
+          test -f /tmp/vorlex-site/index.html
+
+      - name: Build Native Android
+        if: inputs.build_mode == 'native'
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          SOURCE_TYPE: ${{ inputs.source_type }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          BUILD_VARIANT: ${{ inputs.build_variant }}
+        run: |
+          set -euo pipefail
+          rm -rf build_app artifacts build-logs
+          mkdir -p artifacts build-logs
+          SAFE_NAME=$(echo "$APP_NAME" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
+          JAVA_PATH=$(echo "$PACKAGE_NAME" | tr '.' '/')
+
+          mkdir -p "build_app/app/src/main/java/$JAVA_PATH" build_app/app/src/main/assets/site build_app/app/src/main/res/values
+
+          cat > build_app/settings.gradle <<'GRADLE_S'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "VorlexNative"
+          include ":app"
+          GRADLE_S
+
+          cat > build_app/build.gradle <<'GRADLE_R'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          GRADLE_R
+
+          cat > build_app/gradle.properties <<'GRADLE_P'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          GRADLE_P
+
+          cat > build_app/app/build.gradle <<'GRADLE_A'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace System.getenv("PACKAGE_NAME")
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId System.getenv("PACKAGE_NAME")
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          GRADLE_A
+
+          cat > build_app/app/src/main/AndroidManifest.xml <<'MANIFEST'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <application
+              android:theme="@style/AppTheme"
+              android:label="APP_LABEL"
+              android:usesCleartextTraffic="true">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          MANIFEST
+
+          cat > build_app/app/src/main/res/values/styles.xml <<'STYLES'
+          <resources>
+            <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+              <item name="android:fontFamily">sans</item>
+              <item name="android:colorAccent">#6d5dfc</item>
+            </style>
+          </resources>
+          STYLES
+
+          cat > "build_app/app/src/main/java/$JAVA_PATH/MainActivity.java" <<'JAVA_SRC'
+          package PKG_PLACEHOLDER;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebChromeClient;
+          public class MainActivity extends Activity {
+            private WebView webView;
+            @Override
+            protected void onCreate(Bundle b) {
+              super.onCreate(b);
+              webView = new WebView(this);
+              webView.getSettings().setJavaScriptEnabled(true);
+              webView.getSettings().setDomStorageEnabled(true);
+              webView.getSettings().setAllowFileAccess(true);
+              webView.setWebViewClient(new WebViewClient());
+              webView.setWebChromeClient(new WebChromeClient());
+              String type = "TYPE_VAL";
+              String url = "URL_VAL";
+              if ("url".equals(type) && url != null && !url.isEmpty()) {
+                webView.loadUrl(url);
+              } else {
+                webView.loadUrl("file:///android_asset/site/index.html");
+              }
+              setContentView(webView);
+            }
+            @Override
+            public void onBackPressed() {
+              if (webView.canGoBack()) { webView.goBack(); }
+              else { super.onBackPressed(); }
+            }
+          }
+          JAVA_SRC
+
+          MAIN_JAVA="build_app/app/src/main/java/$JAVA_PATH/MainActivity.java"
+          sed -i "s|PKG_PLACEHOLDER|$PACKAGE_NAME|g" "$MAIN_JAVA"
+          ESCAPED_URL=$(echo "$SOURCE_URL" | sed 's/[&/\]/\\&/g')
+          sed -i "s|TYPE_VAL|$SOURCE_TYPE|g" "$MAIN_JAVA"
+          sed -i "s|URL_VAL|$ESCAPED_URL|g" "$MAIN_JAVA"
+          sed -i "s|APP_LABEL|$APP_NAME|g" build_app/app/src/main/AndroidManifest.xml
+
+          if [ "$SOURCE_TYPE" = "url" ] || [ "$SOURCE_TYPE" = "remote" ]; then
+            echo '<!doctype html><meta charset="utf-8"><title>Vorlex</title><p>Loading...' > build_app/app/src/main/assets/site/index.html
+          else
+            cp -R /tmp/vorlex-site/. build_app/app/src/main/assets/site/
+          fi
+
+          cd build_app
+          chmod +x gradlew 2>/dev/null || true
+          gradle --no-daemon --stacktrace assembleRelease 2>&1 | tee ../build-logs/gradle-build.log || { cp ../build-logs/gradle-build.log ../build-logs/last-build.log 2>/dev/null; exit 1; }
+          cp ../build-logs/gradle-build.log ../build-logs/last-build.log 2>/dev/null || true
+          cp app/build/outputs/apk/release/app-release.apk "../artifacts/${SAFE_NAME}.apk"
+
+      - name: Build Flutter Android
+        if: inputs.build_mode == 'flutter'
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          SOURCE_TYPE: ${{ inputs.source_type }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          BUILD_VARIANT: ${{ inputs.build_variant }}
+        run: |
+          set -euo pipefail
+          rm -rf build_app artifacts build-logs
+          mkdir -p artifacts build-logs
+          SAFE_NAME=$(echo "$APP_NAME" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-')
+          PROJECT_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_' | cut -c1-28)
+          PROJECT_NAME=${PROJECT_NAME:-vorlex_app}
+          ORG_NAME=$(echo "$PACKAGE_NAME" | cut -d'.' -f1-2)
+
+          flutter create --platforms=android --org "$ORG_NAME" --project-name "$PROJECT_NAME" build_app
+          cd build_app
+
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          p = Path('pubspec.yaml')
+          s = p.read_text()
+          if 'webview_flutter' not in s:
+              s = s.replace('dependencies:\n', 'dependencies:\n  webview_flutter: ^4.13.0\n', 1)
+          if 'assets/site/' not in s:
+              s = s.replace('flutter:\n  uses-material-design: true', 'flutter:\n  uses-material-design: true\n  assets:\n    - assets/site/')
+          p.write_text(s)
+          PYFIX
+
+          mkdir -p assets/site
+          cp -R /tmp/vorlex-site/. assets/site/
+
+          python3 - <<'PYMANIFEST'
+          from pathlib import Path
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          if 'android.permission.INTERNET' not in s:
+              s = s.replace('<application', '<uses-permission android:name="android.permission.INTERNET"/>\n    <application', 1)
+          if 'usesCleartextTraffic' not in s:
+              s = s.replace('<application', '<application\n        android:usesCleartextTraffic="true"', 1)
+          p.write_text(s)
+          PYMANIFEST
+
+          cat > lib/main.dart <<'DARTSRC'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() => runApp(const VorlexApp());
+
+          class VorlexApp extends StatefulWidget {
+            const VorlexApp({super.key});
+            @override
+            State<VorlexApp> createState() => _VorlexAppState();
+          }
+
+          class _VorlexAppState extends State<VorlexApp> {
+            late final WebViewController controller;
+
+            @override
+            void initState() {
+              super.initState();
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(NavigationDelegate());
+              const t = String.fromEnvironment('SOURCE_TYPE', defaultValue: 'file');
+              const u = String.fromEnvironment('SOURCE_URL', defaultValue: '');
+              if (t == 'url' && u.isNotEmpty) {
+                controller.loadRequest(Uri.parse(u));
+              } else {
+                controller.loadFlutterAsset('assets/site/index.html');
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: String.fromEnvironment('APP_NAME', defaultValue: 'Vorlex Web'),
+                home: Scaffold(
+                  body: SafeArea(
+                    child: WebViewWidget(controller: controller),
+                  ),
+                ),
+              );
+            }
+          }
+          DARTSRC
+
+          flutter pub get 2>&1 | tee ../build-logs/flutter-pub.log || true
+          if [ "$BUILD_VARIANT" = "debug" ]; then
+            flutter build apk --debug --dart-define=APP_NAME="$APP_NAME" --dart-define=SOURCE_TYPE="$SOURCE_TYPE" --dart-define=SOURCE_URL="$SOURCE_URL" 2>&1 | tee ../build-logs/flutter-build.log || { cp ../build-logs/flutter-build.log ../build-logs/last-build.log 2>/dev/null; exit 1; }
+            cp ../build-logs/flutter-build.log ../build-logs/last-build.log 2>/dev/null || true
+            cp build/app/outputs/flutter-apk/app-debug.apk "../artifacts/${SAFE_NAME}-debug.apk"
+          else
+            flutter build apk --release --dart-define=APP_NAME="$APP_NAME" --dart-define=SOURCE_TYPE="$SOURCE_TYPE" --dart-define=SOURCE_URL="$SOURCE_URL" 2>&1 | tee ../build-logs/flutter-build.log || { cp ../build-logs/flutter-build.log ../build-logs/last-build.log 2>/dev/null; exit 1; }
+            cp ../build-logs/flutter-build.log ../build-logs/last-build.log 2>/dev/null || true
+            cp build/app/outputs/flutter-apk/app-release.apk "../artifacts/${SAFE_NAME}-release.apk"
+          fi
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vorlex-apk-${{ inputs.job_id }}
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vorlex-logs-${{ inputs.job_id }}
+          path: build-logs/
+          if-no-files-found: ignore
+          retention-days: 2
